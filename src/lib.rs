@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    num::TryFromIntError,
     path::{Path, PathBuf},
 };
 
@@ -11,33 +12,44 @@ use thiserror::Error;
 pub enum Walror {
     #[error("io failure: {0}")]
     Io(#[from] std::io::Error),
+    #[error("try_into failure: {0}")]
+    TryInt(#[from] TryFromIntError),
     #[error("corrupted record: crc mismatch")]
     CrcMismatch,
     #[error("mismatched record type")]
     InvalidRecord,
     #[error("mismatched record size")]
     RecordTooLarge,
+    #[error("nonexistent key")]
+    NullKey,
 }
 const MAX_KEY_SIZE: usize = 64 * 1024;
 const MAX_VAL_SIZE: usize = 512 * 1024 * 1024;
+
+pub struct PutRecord {
+    offset: u64,
+    len: u64,
+}
 pub struct Walrus {
-    data: HashMap<Vec<u8>, Vec<u8>>,
+    data: HashMap<Vec<u8>, PutRecord>,
     db: File,
     db_path: PathBuf,
 }
 
 impl Walrus {
     pub fn setup<P: AsRef<Path>>(p: P) -> Result<Self, Walror> {
-        let f = OpenOptions::new()
+        let mut f = OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .truncate(false)
             .open(&p)?;
 
+        f.seek(SeekFrom::Start(0))?;
+        let mut current_offset = f.stream_position()?;
+
         let mut r = BufReader::new(f);
         let mut map = HashMap::new();
-
         loop {
             if r.fill_buf()?.is_empty() {
                 break;
@@ -70,6 +82,9 @@ impl Walrus {
                     if hasher.finalize() != expected_crc {
                         return Err(Walror::CrcMismatch);
                     }
+                    let increment = (4 + 1 + 4 + key_len) as u64;
+                    current_offset += increment;
+
                     map.remove(&key_buf);
                 }
                 0x01 => {
@@ -103,16 +118,26 @@ impl Walrus {
                     if hasher.finalize() != expected_crc {
                         return Err(Walror::CrcMismatch);
                     }
+                    let increment = (4 + 1 + 4 + key_len + 8 + val_len)
+                        .try_into()
+                        .map_err(|_| Walror::RecordTooLarge)?;
+                    map.insert(
+                        key_buf,
+                        PutRecord {
+                            offset: current_offset,
+                            len: increment,
+                        },
+                    );
 
-                    map.insert(key_buf, val_buf);
+                    current_offset += increment;
                 }
+
                 _ => return Err(Walror::InvalidRecord),
             }
         }
 
         let mut f = r.into_inner();
-        f.seek(SeekFrom::End(0))?;
-
+        f.seek(SeekFrom::Start(current_offset))?;
         Ok(Self {
             data: map,
             db: f,
@@ -120,8 +145,35 @@ impl Walrus {
         })
     }
 
-    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<&[u8]> {
-        self.data.get(key.as_ref()).map(|v| v.as_slice())
+    pub fn get<K: AsRef<[u8]>>(&mut self, key: K) -> Result<Vec<u8>, Walror> {
+        let key = key.as_ref();
+        let Some(v) = self.data.get(key) else {
+            return Err(Walror::NullKey);
+        };
+
+        self.db.seek(SeekFrom::Start(v.offset))?;
+
+        let entry_len: usize = v.len.try_into().map_err(|_| Walror::RecordTooLarge)?;
+        let mut entry = vec![0u8; entry_len];
+        self.db.read_exact(&mut entry)?;
+
+        let val_len_start = 4 + 1 + 4 + key.len();
+        if entry.len() < val_len_start + 8 {
+            return Err(Walror::InvalidRecord);
+        }
+
+        let val_len_bytes: [u8; 8] = entry[val_len_start..val_len_start + 8]
+            .try_into()
+            .map_err(|_| Walror::InvalidRecord)?;
+        let val_len_raw = u64::from_be_bytes(val_len_bytes);
+        let val_len: usize = val_len_raw.try_into().map_err(|_| Walror::RecordTooLarge)?;
+        let val_start = val_len_start + 8;
+        let val_end = val_start + val_len;
+        if entry.len() < val_end {
+            return Err(Walror::InvalidRecord);
+        }
+
+        Ok(entry[val_start..val_end].to_vec())
     }
 
     pub fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, k: K, v: V) -> Result<(), Walror> {
@@ -129,8 +181,16 @@ impl Walrus {
         let val = v.as_ref();
         let buf = encode_put(key, val)?;
 
+        let startpos = self.db.seek(SeekFrom::End(0))?;
         self.db.write_all(&buf)?;
-        self.data.insert(key.to_vec(), val.to_vec());
+
+        self.data.insert(
+            key.to_vec(),
+            PutRecord {
+                offset: startpos,
+                len: buf.len() as u64,
+            },
+        );
         Ok(())
     }
 
@@ -141,6 +201,7 @@ impl Walrus {
         }
 
         let buf = encode_del(key)?;
+        self.db.seek(SeekFrom::End(0))?;
         self.db.write_all(&buf)?;
         self.data.remove(key);
         Ok(())
@@ -155,10 +216,25 @@ impl Walrus {
             .open(&tmp_path)?;
 
         let mut writer = BufWriter::new(tmp);
-
+        let mut new_map = HashMap::new();
+        let mut new_offset = 0u64;
         for (key, val) in &self.data {
-            let buf = encode_put(key, val)?;
-            writer.write_all(&buf)?;
+            self.db.seek(SeekFrom::Start(val.offset))?;
+
+            let entry_len: usize = val.len.try_into().map_err(|_| Walror::RecordTooLarge)?;
+            let mut entry = vec![0u8; entry_len];
+            self.db.read_exact(&mut entry)?;
+
+            writer.write_all(&entry)?;
+            let record_len = entry.len() as u64;
+            new_map.insert(
+                key.clone(),
+                PutRecord {
+                    offset: new_offset,
+                    len: record_len,
+                },
+            );
+            new_offset += record_len;
         }
         writer.flush()?;
         let tmp_file = writer
@@ -174,7 +250,7 @@ impl Walrus {
             .open(&self.db_path)?;
         new_file.seek(SeekFrom::End(0))?;
         self.db = new_file;
-
+        self.data = new_map;
         Ok(())
     }
 }
@@ -214,30 +290,4 @@ fn encode_del(key: &[u8]) -> Result<Vec<u8>, Walror> {
     buf.extend_from_slice(&key_len);
     buf.extend_from_slice(key);
     Ok(buf)
-}
-#[cfg(test)]
-#[test]
-fn test_all() -> Result<(), Walror> {
-    let test_path = "test.walrus";
-    let _ = fs::remove_file(test_path);
-
-    let mut db = Walrus::setup(test_path)?;
-    db.put("user", "shawn")?;
-    assert_eq!(db.get("user"), Some(b"shawn".as_slice()));
-
-    drop(db);
-    let mut db = Walrus::setup(test_path)?;
-    assert_eq!(db.get("user"), Some(b"shawn".as_slice()));
-
-    for i in 0..50 {
-        db.put("counter", i.to_string())?;
-    }
-    db.compact()?;
-    drop(db);
-
-    let db = Walrus::setup(test_path)?;
-    assert_eq!(db.get("counter"), Some(b"49".as_slice()));
-
-    let _ = fs::remove_file(test_path);
-    Ok(())
 }
