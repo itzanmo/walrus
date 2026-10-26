@@ -38,18 +38,18 @@ pub struct Walrus {
 
 impl Walrus {
     pub fn setup<P: AsRef<Path>>(p: P) -> Result<Self, Walror> {
-        let mut f = OpenOptions::new()
+        let f = OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .truncate(false)
             .open(&p)?;
 
-        f.seek(SeekFrom::Start(0))?;
-        let mut current_offset = f.stream_position()?;
-
+        // BufReader is ONLY used locally here for sequential log replay
         let mut r = BufReader::new(f);
         let mut map = HashMap::new();
+        let mut current_offset = 0u64;
+
         loop {
             if r.fill_buf()?.is_empty() {
                 break;
@@ -57,7 +57,6 @@ impl Walrus {
 
             let mut crc_buf = [0u8; 4];
             r.read_exact(&mut crc_buf)?;
-
             let expected_crc = u32::from_be_bytes(crc_buf);
 
             let mut op = [0u8; 1];
@@ -131,13 +130,14 @@ impl Walrus {
 
                     current_offset += increment;
                 }
-
                 _ => return Err(Walror::InvalidRecord),
             }
         }
 
+        // drop BufReader, take back the raw File, park cursor at the end for writes
         let mut f = r.into_inner();
         f.seek(SeekFrom::Start(current_offset))?;
+
         Ok(Self {
             data: map,
             db: f,
@@ -152,7 +152,6 @@ impl Walrus {
         };
 
         self.db.seek(SeekFrom::Start(v.offset))?;
-
         let entry_len: usize = v.len.try_into().map_err(|_| Walror::RecordTooLarge)?;
         let mut entry = vec![0u8; entry_len];
         self.db.read_exact(&mut entry)?;
@@ -165,8 +164,9 @@ impl Walrus {
         let val_len_bytes: [u8; 8] = entry[val_len_start..val_len_start + 8]
             .try_into()
             .map_err(|_| Walror::InvalidRecord)?;
-        let val_len_raw = u64::from_be_bytes(val_len_bytes);
-        let val_len: usize = val_len_raw.try_into().map_err(|_| Walror::RecordTooLarge)?;
+        let val_len: usize = u64::from_be_bytes(val_len_bytes)
+            .try_into()
+            .map_err(|_| Walror::RecordTooLarge)?;
         let val_start = val_len_start + 8;
         let val_end = val_start + val_len;
         if entry.len() < val_end {
@@ -218,6 +218,7 @@ impl Walrus {
         let mut writer = BufWriter::new(tmp);
         let mut new_map = HashMap::new();
         let mut new_offset = 0u64;
+
         for (key, val) in &self.data {
             self.db.seek(SeekFrom::Start(val.offset))?;
 
@@ -236,13 +237,13 @@ impl Walrus {
             );
             new_offset += record_len;
         }
+
         writer.flush()?;
         let tmp_file = writer
             .into_inner()
             .map_err(|e| Walror::Io(e.into_error()))?;
         tmp_file.sync_all()?;
         drop(tmp_file);
-
         fs::rename(&tmp_path, &self.db_path)?;
         let mut new_file = OpenOptions::new()
             .write(true)
