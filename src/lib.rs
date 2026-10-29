@@ -4,9 +4,11 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     num::TryFromIntError,
     path::{Path, PathBuf},
+    thread,
 };
 
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Error, Debug)]
 pub enum Walror {
@@ -25,7 +27,24 @@ pub enum Walror {
 }
 const MAX_KEY_SIZE: usize = 64 * 1024;
 const MAX_VAL_SIZE: usize = 512 * 1024 * 1024;
-
+pub enum WalCmd {
+    Get {
+        key: Vec<u8>,
+        resp: oneshot::Sender<Result<Vec<u8>, Walror>>,
+    },
+    Put {
+        key: Vec<u8>,
+        val: Vec<u8>,
+        resp: oneshot::Sender<Result<(), Walror>>,
+    },
+    Del {
+        key: Vec<u8>,
+        resp: oneshot::Sender<Result<(), Walror>>,
+    },
+    Compact {
+        resp: oneshot::Sender<Result<(), Walror>>,
+    },
+}
 pub struct PutRecord {
     offset: u64,
     len: u64,
@@ -45,7 +64,6 @@ impl Walrus {
             .truncate(false)
             .open(&p)?;
 
-        // BufReader is ONLY used locally here for sequential log replay
         let mut r = BufReader::new(f);
         let mut map = HashMap::new();
         let mut current_offset = 0u64;
@@ -134,7 +152,6 @@ impl Walrus {
             }
         }
 
-        // drop BufReader, take back the raw File, park cursor at the end for writes
         let mut f = r.into_inner();
         f.seek(SeekFrom::Start(current_offset))?;
 
@@ -253,6 +270,32 @@ impl Walrus {
         self.db = new_file;
         self.data = new_map;
         Ok(())
+    }
+    pub fn async_init(mut self) -> Result<mpsc::Sender<WalCmd>, Walror> {
+        let (tx, mut rx) = mpsc::channel::<WalCmd>(64);
+        let _ = thread::Builder::new()
+            .name("walrus-worker".into())
+            .spawn(move || {
+                while let Some(cmd) = rx.blocking_recv() {
+                    match cmd {
+                        WalCmd::Del { key, resp } => {
+                            let _ = resp.send(self.del(key));
+                        }
+                        WalCmd::Compact { resp } => {
+                            let _ = resp.send(self.compact());
+                        }
+                        WalCmd::Put { key, val, resp } => {
+                            let _ = resp.send(self.put(key, val));
+                        }
+                        WalCmd::Get { key, resp } => {
+                            let _ = resp.send(self.get(key));
+                        }
+                    }
+                }
+            })
+            .map_err(Walror::Io)?;
+
+        Ok(tx)
     }
 }
 fn encode_put(key: &[u8], val: &[u8]) -> Result<Vec<u8>, Walror> {
