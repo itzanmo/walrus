@@ -1,0 +1,64 @@
+use std::error::Error;
+use std::fs;
+use std::path::Path;
+use tokio::sync::oneshot;
+
+use walrus::{WalCmd, Walrus};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let db_path = Path::new("test.db");
+    if db_path.exists() {
+        fs::remove_file(db_path)?;
+    }
+
+    {
+        let mut db = Walrus::setup(db_path)?;
+
+        db.put(b"user:1001", b"alice")?;
+        db.put(b"user:1002", b"bob")?;
+
+        let val = db.get(b"user:1001")?;
+        println!("got user:1001: {}", String::from_utf8_lossy(&val));
+
+        db.del(b"user:1002")?;
+        assert!(db.get(b"user:1002").is_err());
+
+        db.compact()?;
+    }
+
+    {
+        let mut recovered = Walrus::setup(db_path)?;
+        let val = recovered.get(b"user:1001")?;
+        assert_eq!(&val[..], b"alice");
+    }
+
+    {
+        let db = Walrus::setup(db_path)?;
+        let tx = db.async_init()?;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(WalCmd::Put {
+            key: b"server:status".to_vec(),
+            val: b"ready".to_vec(),
+            resp: resp_tx,
+        })
+        .await?;
+        resp_rx.await??;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(WalCmd::Get {
+            key: b"server:status".to_vec(),
+            resp: resp_tx,
+        })
+        .await?;
+        let res = resp_rx.await??;
+        println!("got server:status: {}", String::from_utf8_lossy(&res));
+    }
+
+    if db_path.exists() {
+        fs::remove_file(db_path)?;
+    }
+
+    Ok(())
+}

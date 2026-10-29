@@ -1,26 +1,35 @@
 # Walrus
 
-An append-only, log-structured key-value storage engine in rust backed by an in-memory index and crc-32 record framing.
+An append-only, Bitcask-style key-value store written in Rust.
 
-## Features
-
-- **Append-only durability:** Fast, sequential $o(1)$ writes.
-- **Hardware-accelerated integrity:** records guarded by crc-32 checks on startup and recovery.
-- **Tombstone deletions:** non-destructive deletes appended to the log; zero random disk seeks.
-- **Atomic compaction:** reclaim disk space from old versions and deleted records via temporary file staging and atomic renames.
+Keys and `{offset, len}` locations are held in an in-memory `HashMap`. Payloads stay on disk. Reads perform an in-memory lookup followed by a single file seek and read. Writes append directly to the log.
 
 ---
 
-## On-disk format
+## Known Quirks & Roadmap
 
-Walrus formats records sequentially into a single append-only log file using big-endian framing:
+- **CRC Validation:** Record CRCs are validated during startup replay. `get()` currently reads slices directly without re-hashing on the hot path.
+- **Sync Guarantees:** Writes rely on the OS page cache (`sync_all` is deferred). Explicit batch fsyncing for the async worker is in progress.
 
-### Del record (`op = 0x00`)
+---
 
-### Put record (`op = 0x01`)
+## Architecture
+
+- **Append-only Writes:** O(1) sequential appends with CRC-32 framing.
+- **Bitcask Index:** In-memory key directory pointing to disk offsets.
+- **Compaction:** Re-indexes live keys into a `.tmp` log, flushes, syncs, and performs an atomic rename.
+- **Concurrency:** Dedicated single-threaded worker actor communicating via Tokio MPSC and oneshot channels.
+
+---
+
+## File Layout
+
+Records are big-endian and framed sequentially.
+
+### Delete / Tombstone (`op = 0x00`)
 
 ```text
-+----------+---------+-------------+-----+-------------+-------+
-| crc (4b) | op (1b) | klen (4b)   | key | vlen (8b)   | value |
-+----------+---------+-------------+-----+-------------+-------+
++----------+---------+-----------+-----+
+| crc (4b) | op (1b) | klen (4b) | key |
++----------+---------+-----------+-----+
 ```
