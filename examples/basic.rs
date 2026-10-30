@@ -1,9 +1,8 @@
 use std::error::Error;
 use std::fs;
 use std::path::Path;
-use tokio::sync::oneshot;
 
-use walrus::{WalCmd, Walrus};
+use walrus::Walrus;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -12,6 +11,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         fs::remove_file(db_path)?;
     }
 
+    // 1. sync engine writes
     {
         let mut db = Walrus::setup(db_path)?;
 
@@ -27,33 +27,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         db.compact()?;
     }
 
+    // 2. verify recovery from disk
     {
         let mut recovered = Walrus::setup(db_path)?;
         let val = recovered.get(b"user:1001")?;
         assert_eq!(&val[..], b"alice");
     }
 
+    // 3. async client interface
     {
         let db = Walrus::setup(db_path)?;
-        let tx = db.async_init()?;
+        let client = db.async_init()?;
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(WalCmd::Put {
-            key: b"server:status".to_vec(),
-            val: b"ready".to_vec(),
-            resp: resp_tx,
-        })
-        .await?;
-        resp_rx.await??;
+        client.put(b"server:status", b"ready").await?;
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(WalCmd::Get {
-            key: b"server:status".to_vec(),
-            resp: resp_tx,
-        })
-        .await?;
-        let res = resp_rx.await??;
+        let res = client.get(b"server:status").await?;
         println!("got server:status: {}", String::from_utf8_lossy(&res));
+
+        client.del(b"server:status").await?;
+        assert!(client.get(b"server:status").await.is_err());
     }
 
     if db_path.exists() {

@@ -3,8 +3,7 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
-    use tokio::sync::oneshot;
-    use walrus::*;
+    use walrus::{Walror, Walrus};
 
     struct TestEnv {
         path: PathBuf,
@@ -123,44 +122,28 @@ mod tests {
     async fn test_async_actor_loop() -> Result<(), Box<dyn std::error::Error>> {
         let env = TestEnv::new("async");
         let db = Walrus::setup(&env.path)?;
-        let tx = db.async_init()?;
+        let client = db.async_init()?;
 
-        let (put_tx, put_rx) = oneshot::channel();
-        tx.send(WalCmd::Put {
-            key: b"async_k".to_vec(),
-            val: b"async_v".to_vec(),
-            resp: put_tx,
-        })
-        .await?;
-        put_rx.await??;
+        // put & get
+        client.put(b"async_k", b"async_v").await?;
+        assert_eq!(client.get(b"async_k").await?, b"async_v");
 
-        let (get_tx, get_rx) = oneshot::channel();
-        tx.send(WalCmd::Get {
-            key: b"async_k".to_vec(),
-            resp: get_tx,
-        })
-        .await?;
-        assert_eq!(get_rx.await??, b"async_v");
+        // compact
+        client.compact().await?;
+        assert_eq!(client.get(b"async_k").await?, b"async_v");
 
-        let (compact_tx, compact_rx) = oneshot::channel();
-        tx.send(WalCmd::Compact { resp: compact_tx }).await?;
-        compact_rx.await??;
+        // del & verify null
+        client.del(b"async_k").await?;
+        assert!(matches!(client.get(b"async_k").await, Err(Walror::NullKey)));
 
-        let (del_tx, del_rx) = oneshot::channel();
-        tx.send(WalCmd::Del {
-            key: b"async_k".to_vec(),
-            resp: del_tx,
-        })
-        .await?;
-        del_rx.await??;
+        // test client clone works across concurrent tasks
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move {
+            client_clone.put(b"task_k", b"task_v").await.unwrap();
+        });
+        handle.await?;
 
-        let (verify_tx, verify_rx) = oneshot::channel();
-        tx.send(WalCmd::Get {
-            key: b"async_k".to_vec(),
-            resp: verify_tx,
-        })
-        .await?;
-        assert!(matches!(verify_rx.await?, Err(Walror::NullKey)));
+        assert_eq!(client.get(b"task_k").await?, b"task_v");
 
         Ok(())
     }

@@ -8,8 +8,55 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc::{self, Sender, error::SendError},
+    oneshot::{self},
+};
+#[derive(Clone)]
+pub struct WalClient {
+    tx: Sender<WalCmd>,
+}
+impl WalClient {
+    pub async fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Vec<u8>, Walror> {
+        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, Walror>>();
+        self.tx
+            .send(WalCmd::Get {
+                key: key.as_ref().to_vec(),
+                resp: tx,
+            })
+            .await?;
+        rx.await?
+    }
 
+    pub async fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, k: K, v: V) -> Result<(), Walror> {
+        let (tx, rx) = oneshot::channel::<Result<(), Walror>>();
+        self.tx
+            .send(WalCmd::Put {
+                key: k.as_ref().to_vec(),
+                val: v.as_ref().to_vec(),
+                resp: tx,
+            })
+            .await?;
+        rx.await?
+    }
+
+    pub async fn compact(&self) -> Result<(), Walror> {
+        let (tx, rx) = oneshot::channel::<Result<(), Walror>>();
+        self.tx.send(WalCmd::Compact { resp: tx }).await?;
+        rx.await?
+    }
+
+    pub async fn del<K: AsRef<[u8]>>(&self, k: K) -> Result<(), Walror> {
+        let (tx, rx) = oneshot::channel::<Result<(), Walror>>();
+        self.tx
+            .send(WalCmd::Del {
+                key: k.as_ref().to_vec(),
+                resp: tx,
+            })
+            .await?;
+        rx.await?
+    }
+}
 #[derive(Error, Debug)]
 pub enum Walror {
     #[error("io failure: {0}")]
@@ -24,6 +71,10 @@ pub enum Walror {
     RecordTooLarge,
     #[error("nonexistent key")]
     NullKey,
+    #[error("recv error")]
+    RecvError(#[from] oneshot::error::RecvError),
+    #[error("wal worker channel closed, failed to send command")]
+    WorkerSend(#[from] SendError<WalCmd>),
 }
 const MAX_KEY_SIZE: usize = 64 * 1024;
 const MAX_VAL_SIZE: usize = 512 * 1024 * 1024;
@@ -271,7 +322,7 @@ impl Walrus {
         self.data = new_map;
         Ok(())
     }
-    pub fn async_init(mut self) -> Result<mpsc::Sender<WalCmd>, Walror> {
+    pub fn async_init(mut self) -> Result<WalClient, Walror> {
         let (tx, mut rx) = mpsc::channel::<WalCmd>(64);
         let _ = thread::Builder::new()
             .name("walrus-worker".into())
@@ -295,7 +346,7 @@ impl Walrus {
             })
             .map_err(Walror::Io)?;
 
-        Ok(tx)
+        Ok(WalClient { tx })
     }
 }
 fn encode_put(key: &[u8], val: &[u8]) -> Result<Vec<u8>, Walror> {
